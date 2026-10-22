@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rewind</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f3f5f8;
+    --surface: #ffffff;
+    --ink: #17202c;
+    --muted: #5c6878;
+    --line: #dde2e9;
+    --queued: #8a96a8;
+    --running: #2f5bea;
+    --retrying: #c27c0e;
+    --succeeded: #1f8a5b;
+    --dead: #c0352b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #121820;
+      --surface: #1a222d;
+      --ink: #e7ecf3;
+      --muted: #94a0b2;
+      --line: #2b3542;
+      --queued: #6f7b8e;
+      --running: #6b8cff;
+      --retrying: #e0a23a;
+      --succeeded: #3fbf86;
+      --dead: #f0675c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 1040px; margin: 0 auto; padding: 32px 20px 48px; }
+  h1 { font-size: 28px; letter-spacing: -0.02em; margin: 0; }
+  .sub { color: var(--muted); margin: 4px 0 28px; }
+
+  /* The one bold element: every job, flowing through its states */
+  .flow { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 22px; }
+  .bar { display: flex; height: 44px; border-radius: 8px; overflow: hidden; background: var(--line); }
+  .bar span { transition: flex-grow .4s ease; min-width: 0; }
+  @media (prefers-reduced-motion: reduce) { .bar span { transition: none; } }
+  .legend { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; margin-top: 16px; }
+  .legend div { font-size: 13px; color: var(--muted); }
+  .legend b { display: block; font-size: 26px; color: var(--ink); font-variant-numeric: tabular-nums; }
+  .legend i { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; }
+
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 1px;
+           background: var(--line); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; margin: 18px 0 28px; }
+  .stats div { background: var(--surface); padding: 14px 16px; }
+  .stats dt { font-size: 13px; color: var(--muted); }
+  .stats dd { margin: 2px 0 0; font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
+
+  .cols { display: grid; grid-template-columns: 1.3fr 1fr; gap: 20px; }
+  @media (max-width: 760px) { .cols { grid-template-columns: 1fr; } .legend { grid-template-columns: repeat(3, 1fr); } }
+  h2 { font-size: 17px; margin: 0 0 10px; display: flex; justify-content: space-between; align-items: center; }
+  .panel { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 18px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  td { padding: 8px 4px; border-top: 1px solid var(--line); vertical-align: top; }
+  td.id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted); white-space: nowrap; }
+  .empty { color: var(--muted); font-size: 14px; padding: 8px 0; }
+  button {
+    font: inherit; font-size: 13px; font-weight: 600; cursor: pointer;
+    border: 1px solid var(--dead); color: var(--dead); background: transparent;
+    padding: 5px 12px; border-radius: 8px;
+  }
+  button:hover { background: var(--dead); color: var(--surface); }
+  button:focus-visible { outline: 2px solid var(--running); outline-offset: 2px; }
+  button:disabled { opacity: .4; cursor: default; background: transparent; color: var(--dead); }
+  ol { list-style: none; margin: 0; padding: 0; font-size: 13px; }
+  ol li { padding: 6px 0; border-top: 1px solid var(--line); display: flex; gap: 8px; }
+  ol li span:first-child { color: var(--muted); font-variant-numeric: tabular-nums; min-width: 64px; }
+  .k-succeeded { color: var(--succeeded); } .k-dead_lettered { color: var(--dead); }
+  .k-retry_scheduled { color: var(--retrying); } .k-lease_expired, .k-stale_write_rejected { color: var(--running); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Rewind</h1>
+  <p class="sub">Durable job runner for LLM inference. Nothing gets lost, failed jobs can be replayed.</p>
+
+  <section class="flow" aria-label="Jobs by state">
+    <div class="bar" id="bar"></div>
+    <div class="legend" id="legend"></div>
+  </section>
+
+  <dl class="stats" id="stats"></dl>
+
+  <div class="cols">
+    <section class="panel">
+      <h2>Dead letters <button id="replayAll" disabled>Replay all</button></h2>
+      <div id="dead"></div>
+    </section>
+    <section class="panel">
+      <h2>Recent activity</h2>
+      <ol id="events"></ol>
+    </section>
+  </div>
+</main>
+<script>
+const STATES = ["queued", "running", "retrying", "succeeded", "dead"];
+const LABELS = { queued: "Waiting", running: "Running", retrying: "Retrying", succeeded: "Done", dead: "Failed" };
+const fmt = (v, d = 0) => v === null || v === undefined ? "–" : Number(v).toLocaleString(undefined, { maximumFractionDigits: d });
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+async function replay(ids) {
+  await fetch("/dlq/replay", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ job_ids: ids }) });
+  refresh();
+}
+document.getElementById("replayAll").onclick = () => replay(null);
+
+async function refresh() {
+  try {
+    const [m, dead, ev] = await Promise.all([
+      fetch("/metrics").then(r => r.json()),
+      fetch("/jobs?status=dead&limit=20").then(r => r.json()),
+      fetch("/events?limit=25").then(r => r.json()),
+    ]);
+    const total = Math.max(1, m.total_jobs);
+    document.getElementById("bar").innerHTML = STATES.map(s =>
+      `<span title="${LABELS[s]}: ${m.counts[s]}" style="flex-grow:${m.counts[s] / total};background:var(--${s})"></span>`).join("");
+    document.getElementById("legend").innerHTML = STATES.map(s =>
+      `<div><i style="background:var(--${s})"></i>${LABELS[s]}<b>${fmt(m.counts[s])}</b></div>`).join("");
+
+    const stats = [
+      ["Success rate", m.success_rate === null ? "–" : (m.success_rate * 100).toFixed(1) + "%"],
+      ["Retries", fmt(m.retries_scheduled)],
+      ["Recovered from crashed workers", fmt(m.leases_recovered)],
+      ["Duplicate submits blocked", fmt(m.duplicates_ignored)],
+      ["Latency p50 / p95", m.latency_ms_p50 === null ? "–" : `${fmt(m.latency_ms_p50)} / ${fmt(m.latency_ms_p95)} ms`],
+      ["Tokens", fmt(m.prompt_tokens + m.completion_tokens)],
+      ["Cost", m.cost_usd ? "$" + m.cost_usd.toFixed(4) : "–"],
+    ];
+    document.getElementById("stats").innerHTML = stats.map(([k, v]) => `<div><dt>${k}</dt><dd>${v}</dd></div>`).join("");
+
+    document.getElementById("replayAll").disabled = dead.length === 0;
+    document.getElementById("dead").innerHTML = dead.length === 0
+      ? `<p class="empty">No failed jobs. Jobs land here after running out of retries or hitting a non-retryable error.</p>`
+      : `<table>${dead.map(j => `<tr><td class="id">${esc(j.id.slice(0, 8))}</td>
+          <td>${esc(j.last_error)}<br><span style="color:var(--muted)">${j.attempts} attempts</span></td>
+          <td><button data-id="${esc(j.id)}">Replay</button></td></tr>`).join("")}</table>`;
+    document.querySelectorAll("#dead button[data-id]").forEach(b => b.onclick = () => replay([b.dataset.id]));
+
+    document.getElementById("events").innerHTML = ev.map(e =>
+      `<li><span>${new Date(e.ts * 1000).toLocaleTimeString()}</span>
+       <span class="k-${esc(e.kind)}">${esc(e.kind.replaceAll("_", " "))}</span>
+       <span style="color:var(--muted)">${esc(e.job_id.slice(0, 8))}</span></li>`).join("");
+  } catch (e) {
+    document.getElementById("events").innerHTML = `<li>Can't reach the server. Check that uvicorn is running.</li>`;
+  }
+}
+refresh();
+setInterval(refresh, 1500);
+</script>
+</body>
+</html>
